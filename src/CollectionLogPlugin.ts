@@ -1,5 +1,6 @@
 import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.class';
 import { SettingsTypes } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
+import { ModelIconCache } from '@evillite/core/src/utilities/modelIconCache';
 
 /**
  * Collection Log / Drop Log (MVP) — tracks every item you EARN, in a bank-style UI, organised by
@@ -13,11 +14,14 @@ import { SettingsTypes } from '@evillite/core/src/interfaces/highlite/plugin/plu
  * fighting (gm.combatTargetId); when an NPC you were engaged with dies near you, the ground items
  * that spawn at its tile within a short window are *your* loot → logged to that mob's source.
  *
- * Item data: EntityManager.itemDefsCache (id → {name, icon}); icons at https://evilquest.net/items/<icon>.
+ * Chest/stall rewards add straight to the inventory (no ground item): we capture the worldObject
+ * you're skilling (lockpick/steal) and attribute inventory gains to it by category. Quest rewards
+ * (dialog-based, no skill object) are the remaining source — not yet wired.
  *
- * Stall/chest/quest rewards add straight to inventory (no ground item) — that path needs inventory
- * hooks and is wired via logCollected() once we finish probing the inventory live. The engine +
- * UI + persistence already support arbitrary sources.
+ * Item data: EntityManager.itemDefsCache (id → {name, icon}); icons at https://evilquest.net/items/<icon>.
+ * Each source also shows its 3D MODEL icon (chicken, chest…) from the shared, core-managed
+ * ModelIconCache ('model-icons') — the same renders the World Map produces. Sources are grouped in
+ * the UI into collapsible NPCs / Stalls & Chests / Quest Rewards categories.
  */
 
 const ICON_BASE = 'https://evilquest.net/items/';
@@ -30,8 +34,22 @@ const REWARD_WINDOW_MS = 5000;  // an inventory gain counts as a chest/stall rew
 const REWARD_CATEGORIES = new Set(['chest', 'stall']);
 
 interface Engaged { name: string; x: number; z: number; defId: number; t: number; }
-interface PendingDrop { name: string; x: number; z: number; t: number; }
-interface SkillObj { id: number; name: string; category: string; t: number; }
+interface PendingDrop { name: string; x: number; z: number; defId: number; t: number; }
+interface SkillObj { id: number; name: string; category: string; defId: number; assetId: string; t: number; }
+
+// What kind of thing a source is — drives both the model icon and the category group.
+type SourceType = 'npc' | 'chest' | 'stall' | 'quest' | 'other';
+interface SourceMeta { type: SourceType; defId?: number; assetId?: string; }
+
+// The collapsible category groups, in display order. Chests + stalls share one group.
+const GROUPS: { key: string; label: string; emoji: string; types: SourceType[] }[] = [
+    { key: 'npc',    label: 'NPCs',            emoji: '⚔️', types: ['npc', 'other'] },
+    { key: 'object', label: 'Stalls & Chests', emoji: '📦', types: ['chest', 'stall'] },
+    { key: 'quest',  label: 'Quest Rewards',   emoji: '📜', types: ['quest'] },
+];
+function groupKeyForType(t: SourceType): string {
+    return GROUPS.find((g) => g.types.includes(t))?.key ?? 'npc';
+}
 
 export default class CollectionLogPlugin extends Plugin {
     pluginName = 'Collection Log';
@@ -53,13 +71,22 @@ export default class CollectionLogPlugin extends Plugin {
     private invReady = false;                         // first snapshot taken (don't log the starting inventory)
     private lastSkillObj: SkillObj | null = null;     // most-recent worldObject we were skilling on
 
+    // Shared, core-managed model icons (rendered by the World Map plugin, read-only here).
+    private modelIcons: Record<string, string> = {};
+    private readonly iconStore = new ModelIconCache();
+
     constructor() {
         super();
         this.settings.deathRangeTiles = { text: 'Max kill distance (tiles)', type: SettingsTypes.range, value: 6, min: 2, max: 14, callback: () => {} } as any;
     }
 
     init(): void { this.settings.enable.value = true; this.ensureData(); }
-    start(): void { this.ensureData(); this.registerSidebarIcon(); this.installKeyHandler(); this.startEngine(); this.info('Collection Log started.'); }
+    start(): void { this.ensureData(); this.loadModelIcons(); this.registerSidebarIcon(); this.installKeyHandler(); this.startEngine(); this.info('Collection Log started.'); }
+
+    /** Pull the shared model-icon cache (NPC/object renders) once at startup. */
+    private loadModelIcons(): void {
+        this.iconStore.load().then((m) => { this.modelIcons = m || {}; if (this.ui) this.renderUI(); }).catch(() => {});
+    }
     stop(): void { this.stopEngine(); if (this.ui) { this.ui.remove(); this.ui = null; } if (this.menuIcon) { this.menuIcon.remove(); this.menuIcon = null; } }
 
     /** Press L to toggle the log (ignored while typing in chat / an input). */
@@ -78,7 +105,11 @@ export default class CollectionLogPlugin extends Plugin {
     private get gm(): any { return this.gameHooks?.GameManager?.Instance ?? (window as any).gm ?? null; }
     private get em(): any { return this.gameHooks?.EntityManager?.Instance ?? null; }
 
-    private ensureData(): void { if (!this.data.log || typeof this.data.log !== 'object') this.data.log = {}; }
+    private ensureData(): void {
+        if (!this.data.log || typeof this.data.log !== 'object') this.data.log = {};
+        if (!this.data.meta || typeof this.data.meta !== 'object') this.data.meta = {};       // source -> SourceMeta
+        if (!this.data.collapsed || typeof this.data.collapsed !== 'object') this.data.collapsed = {}; // groupKey -> bool
+    }
 
     // ── detection engine ──────────────────────────────────────────────────────
     private startEngine(): void { this.stopEngine(); this.engineId = setInterval(() => this.tick(), 120); }
@@ -112,7 +143,7 @@ export default class CollectionLogPlugin extends Plugin {
             if (!live.has(id)) {
                 const e = this.engaged.get(id);
                 if (e && now - e.t < ENGAGED_TTL_MS && p && dist(e.x, e.z, p.x, p.z) <= maxKill) {
-                    this.pending.push({ name: e.name, x: e.x, z: e.z, t: now });
+                    this.pending.push({ name: e.name, x: e.x, z: e.z, defId: e.defId, t: now });
                 }
                 this.engaged.delete(id);
             }
@@ -129,7 +160,7 @@ export default class CollectionLogPlugin extends Plugin {
                 if (this.seenGround.has(gid)) continue;
                 this.seenGround.add(gid);
                 const match = this.pending.find((d) => dist(d.x, d.z, gi.x, gi.z) <= DROP_MATCH_TILES && now - d.t < DROP_WINDOW_MS);
-                if (match) this.logCollected(gi.itemId | 0, gi.quantity | 0 || 1, match.name);
+                if (match) this.logCollected(gi.itemId | 0, gi.quantity | 0 || 1, match.name, { type: 'npc', defId: match.defId });
             }
             // forget ground ids that are gone so re-spawned ids don't leak memory
             for (const id of this.seenGround) if (!seenNow.has(id)) this.seenGround.delete(id);
@@ -142,17 +173,17 @@ export default class CollectionLogPlugin extends Plugin {
         const soid = gm.skillingObjectId | 0;
         if (soid >= 0) {
             const info = this.worldObjectInfo(soid);
-            if (info) this.lastSkillObj = { id: soid, name: info.name, category: info.category, t: now };
+            if (info) this.lastSkillObj = { id: soid, name: info.name, category: info.category, defId: info.defId, assetId: info.assetId, t: now };
         }
         const inv = this.readInventory();
         if (!this.invReady) { this.invSnapshot = inv; this.invReady = true; }
         else {
             const so = this.lastSkillObj;
-            const rewardSrc = so && now - so.t < REWARD_WINDOW_MS && REWARD_CATEGORIES.has(so.category) ? so.name : null;
-            if (rewardSrc) {
+            const isReward = so && now - so.t < REWARD_WINDOW_MS && REWARD_CATEGORIES.has(so.category);
+            if (isReward && so) {
                 for (const [itemId, qty] of inv) {
                     const gained = qty - (this.invSnapshot.get(itemId) || 0);
-                    if (gained > 0) this.logCollected(itemId, gained, rewardSrc);
+                    if (gained > 0) this.logCollected(itemId, gained, so.name, { type: so.category as SourceType, defId: so.defId, assetId: so.assetId });
                 }
             }
             this.invSnapshot = inv;
@@ -171,21 +202,30 @@ export default class CollectionLogPlugin extends Plugin {
         return m;
     }
 
-    /** Resolve a worldObject instance id → its def name + category (chest/stall/rock/…). */
-    private worldObjectInfo(id: number): { name: string; category: string } | null {
+    /** Resolve a worldObject instance id → def name + category + defId + model assetId.
+     *  assetId (e.g. "tier 1 chest") is the shared icon key; it lives on the loaded model. */
+    private worldObjectInfo(id: number): { name: string; category: string; defId: number; assetId: string } | null {
         const gm = this.gm; if (!gm) return null;
         const wo = gm.worldObjectDefs?.get(id); if (!wo) return null;
         const def = gm.objectDefsCache?.get(wo.defId); if (!def) return null;
-        return { name: (def.name ?? `Object #${wo.defId}`) + '', category: (def.category ?? '') + '' };
+        const model = gm.worldObjectModels?.get(id);
+        const assetId = (wo.metadata?.assetId ?? model?.metadata?.assetId ?? wo.assetId ?? '') + '';
+        return { name: (def.name ?? `Object #${wo.defId}`) + '', category: (def.category ?? '') + '', defId: wo.defId | 0, assetId };
     }
 
-    /** Generic entry point — also used for stall/chest/quest rewards once inventory hooks land. */
-    private logCollected(itemId: number, qty: number, source: string): void {
+    /** Generic entry point for every source (mob kill / chest / stall / quest). */
+    private logCollected(itemId: number, qty: number, source: string, meta?: SourceMeta): void {
         if (!itemId || qty <= 0) return;
         this.ensureData();
         const src = source || 'Unknown';
         if (!this.data.log[src]) this.data.log[src] = {};
         this.data.log[src][itemId] = (this.data.log[src][itemId] || 0) + qty;
+        if (meta) {
+            const cur: SourceMeta = this.data.meta[src] || ({} as SourceMeta);
+            // Keep the richest info we've ever seen for this source (e.g. assetId only
+            // streams in while the object is loaded).
+            this.data.meta[src] = { type: meta.type || cur.type || 'other', defId: meta.defId ?? cur.defId, assetId: meta.assetId || cur.assetId };
+        }
         this.info(`+${qty} ${this.itemName(itemId)} from ${src}`);
         if (this.ui) this.renderUI();
     }
@@ -203,6 +243,37 @@ export default class CollectionLogPlugin extends Plugin {
     /** 2D icon if the item ships one, else the pre-rendered 3D icon (every item has one). */
     private itemIcon(itemId: number): string { const ic = this.itemDef(itemId)?.icon; return ic ? ICON_BASE + ic : this.itemIcon3d(itemId); }
     private itemIcon3d(itemId: number): string { return `${ICON_BASE}3d/${itemId}.png`; }
+
+    // ── source identity / icons ───────────────────────────────────────────────
+    /** Stored meta for a source, backfilling type/defId by name for pre-existing log entries. */
+    private sourceMeta(src: string): SourceMeta {
+        const stored: SourceMeta | undefined = this.data.meta?.[src];
+        if (stored && stored.type) return stored;
+        const inferred = this.inferMeta(src);
+        if (inferred && this.data.meta) this.data.meta[src] = inferred;
+        return inferred ?? { type: 'other' };
+    }
+
+    /** Best-effort: resolve an old source name to its type/defId via the live def caches. */
+    private inferMeta(name: string): SourceMeta | null {
+        const em = this.em, gm = this.gm;
+        const ndc: Map<any, any> | undefined = em?.npcDefsCache;
+        if (ndc) for (const [defId, def] of ndc) if ((def?.name ?? '') + '' === name) return { type: 'npc', defId: defId | 0 };
+        const odc: Map<any, any> | undefined = gm?.objectDefsCache;
+        if (odc) for (const [defId, def] of odc) if ((def?.name ?? '') + '' === name) {
+            const cat = (def?.category ?? '') + '';
+            if (cat === 'chest' || cat === 'stall') return { type: cat as SourceType, defId: defId | 0 };
+        }
+        return null;
+    }
+
+    /** The shared model-icon dataURL for a source, or null if not cached yet. */
+    private sourceIcon(src: string): string | null {
+        const m = this.sourceMeta(src);
+        if (m.type === 'npc' && m.defId != null) return ModelIconCache.resolveNpc(this.modelIcons, m.defId);
+        if (m.type === 'chest' || m.type === 'stall') return ModelIconCache.resolveObject(this.modelIcons, m.assetId, m.defId);
+        return null;
+    }
 
     // ── UI (bank-style) ───────────────────────────────────────────────────────
     private registerSidebarIcon(attempt = 0): void {
@@ -244,22 +315,51 @@ export default class CollectionLogPlugin extends Plugin {
         this.renderUI();
     }
 
+    /** A small left-aligned source icon: the model render if cached, else a category glyph. */
+    private sourceIconHtml(src: string, size: number): string {
+        const url = this.sourceIcon(src);
+        if (url) return `<img src="${url}" style="width:${size}px;height:${size}px;object-fit:contain;flex:none">`;
+        const glyph = { npc: '⚔️', chest: '📦', stall: '📦', quest: '📜', other: '•' }[this.sourceMeta(src).type] ?? '•';
+        return `<span style="width:${size}px;height:${size}px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:${Math.floor(size * 0.7)}px">${glyph}</span>`;
+    }
+
     private renderUI(): void {
         if (!this.ui) return;
         const log = this.data.log || {};
-        const sources = Object.keys(log).sort();
-        if (!this.selectedSource || !log[this.selectedSource]) this.selectedSource = sources[0] || '';
+        const sources = Object.keys(log);
+        if (!this.selectedSource || !log[this.selectedSource]) this.selectedSource = sources.sort()[0] || '';
+
+        // bucket sources into their display group
+        const byGroup = new Map<string, string[]>();
+        for (const g of GROUPS) byGroup.set(g.key, []);
+        for (const src of sources) byGroup.get(groupKeyForType(this.sourceMeta(src).type))!.push(src);
+        for (const arr of byGroup.values()) arr.sort();
 
         const tabs = this.ui.querySelector('#cl-tabs') as HTMLDivElement;
         tabs.innerHTML = '';
-        for (const src of sources) {
-            const n = Object.keys(log[src]).length;
-            const t = document.createElement('div');
-            t.textContent = `${src} (${n})`;
-            Object.assign(t.style, { padding: '5px 8px', cursor: 'pointer', borderRadius: '3px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                background: src === this.selectedSource ? '#4a3d2c' : 'transparent', color: src === this.selectedSource ? '#ffd24a' : '#d8cdb6' } as CSSStyleDeclaration);
-            t.onclick = () => { this.selectedSource = src; this.renderUI(); };
-            tabs.appendChild(t);
+        for (const g of GROUPS) {
+            const members = byGroup.get(g.key)!;
+            if (!members.length) continue;
+            const collapsed = !!this.data.collapsed[g.key];
+
+            const header = document.createElement('div');
+            Object.assign(header.style, { display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 6px', cursor: 'pointer',
+                color: '#ffd24a', fontWeight: '600', fontSize: '12px', borderRadius: '3px', userSelect: 'none' } as CSSStyleDeclaration);
+            header.innerHTML = `<span style="width:10px;flex:none">${collapsed ? '▸' : '▾'}</span><span>${g.emoji} ${g.label}</span><span style="margin-left:auto;color:#8a8070;font-size:11px">${members.length}</span>`;
+            header.onclick = () => { this.data.collapsed[g.key] = !collapsed; this.renderUI(); };
+            tabs.appendChild(header);
+
+            if (collapsed) continue;
+            for (const src of members) {
+                const n = Object.keys(log[src]).length;
+                const row = document.createElement('div');
+                Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '7px', padding: '4px 6px 4px 14px', cursor: 'pointer',
+                    borderRadius: '3px', whiteSpace: 'nowrap', overflow: 'hidden',
+                    background: src === this.selectedSource ? '#4a3d2c' : 'transparent', color: src === this.selectedSource ? '#ffd24a' : '#d8cdb6' } as CSSStyleDeclaration);
+                row.innerHTML = `${this.sourceIconHtml(src, 22)}<span style="overflow:hidden;text-overflow:ellipsis">${src}</span><span style="margin-left:auto;color:#8a8070;font-size:11px">${n}</span>`;
+                row.onclick = () => { this.selectedSource = src; this.renderUI(); };
+                tabs.appendChild(row);
+            }
         }
         if (!sources.length) tabs.innerHTML = '<div style="padding:8px;color:#8a8070;font-size:11px">No drops yet — go kill something.</div>';
 
