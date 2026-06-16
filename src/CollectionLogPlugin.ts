@@ -24,9 +24,14 @@ const ICON_BASE = 'https://evilquest.net/items/';
 const DROP_MATCH_TILES = 2;     // ground item must spawn within this many tiles of the death
 const DROP_WINDOW_MS = 6000;    // …and within this long after the death
 const ENGAGED_TTL_MS = 15000;   // an NPC counts as "yours" if you targeted it within this window
+const REWARD_WINDOW_MS = 5000;  // an inventory gain counts as a chest/stall reward if you skilled it this recently
+// Object categories whose skilling action yields a "reward" worth logging (vs. gathering/combat).
+// Chests (Lockpick/Unlock) and stalls (Steal-from) deposit straight into the inventory.
+const REWARD_CATEGORIES = new Set(['chest', 'stall']);
 
 interface Engaged { name: string; x: number; z: number; defId: number; t: number; }
 interface PendingDrop { name: string; x: number; z: number; t: number; }
+interface SkillObj { id: number; name: string; category: string; t: number; }
 
 export default class CollectionLogPlugin extends Plugin {
     pluginName = 'Collection Log';
@@ -42,6 +47,11 @@ export default class CollectionLogPlugin extends Plugin {
     private pending: PendingDrop[] = [];
     private seenGround = new Set<number>();          // ground-item instance ids already processed
     private selectedSource = '';
+
+    // chest/stall reward detection (rewards land straight in the inventory, no ground item)
+    private invSnapshot = new Map<number, number>(); // itemId -> total qty currently in inventory
+    private invReady = false;                         // first snapshot taken (don't log the starting inventory)
+    private lastSkillObj: SkillObj | null = null;     // most-recent worldObject we were skilling on
 
     constructor() {
         super();
@@ -124,6 +134,49 @@ export default class CollectionLogPlugin extends Plugin {
             // forget ground ids that are gone so re-spawned ids don't leak memory
             for (const id of this.seenGround) if (!seenNow.has(id)) this.seenGround.delete(id);
         }
+
+        // 4) chest/stall rewards: capture the worldObject we're skilling, then attribute
+        //    inventory gains to it. Lockpicking a chest / stealing from a stall is a timed
+        //    skilling action, so skillingObjectId is set for a window we poll here; it deposits
+        //    straight into the inventory (no ground item), so we diff the inventory.
+        const soid = gm.skillingObjectId | 0;
+        if (soid >= 0) {
+            const info = this.worldObjectInfo(soid);
+            if (info) this.lastSkillObj = { id: soid, name: info.name, category: info.category, t: now };
+        }
+        const inv = this.readInventory();
+        if (!this.invReady) { this.invSnapshot = inv; this.invReady = true; }
+        else {
+            const so = this.lastSkillObj;
+            const rewardSrc = so && now - so.t < REWARD_WINDOW_MS && REWARD_CATEGORIES.has(so.category) ? so.name : null;
+            if (rewardSrc) {
+                for (const [itemId, qty] of inv) {
+                    const gained = qty - (this.invSnapshot.get(itemId) || 0);
+                    if (gained > 0) this.logCollected(itemId, gained, rewardSrc);
+                }
+            }
+            this.invSnapshot = inv;
+        }
+    }
+
+    /** Sum the player's inventory by item id, read from the live inventory DOM. */
+    private readInventory(): Map<number, number> {
+        const m = new Map<number, number>();
+        document.querySelectorAll<HTMLElement>('.item-icon[data-item-id]').forEach((el) => {
+            const id = parseInt(el.dataset.itemId || '', 10);
+            if (!id) return;
+            const q = parseInt(el.dataset.itemQuantity || '1', 10) || 1;
+            m.set(id, (m.get(id) || 0) + q);
+        });
+        return m;
+    }
+
+    /** Resolve a worldObject instance id → its def name + category (chest/stall/rock/…). */
+    private worldObjectInfo(id: number): { name: string; category: string } | null {
+        const gm = this.gm; if (!gm) return null;
+        const wo = gm.worldObjectDefs?.get(id); if (!wo) return null;
+        const def = gm.objectDefsCache?.get(wo.defId); if (!def) return null;
+        return { name: (def.name ?? `Object #${wo.defId}`) + '', category: (def.category ?? '') + '' };
     }
 
     /** Generic entry point — also used for stall/chest/quest rewards once inventory hooks land. */

@@ -5,7 +5,10 @@ var ICON_BASE = "https://evilquest.net/items/";
 var DROP_MATCH_TILES = 2;
 var DROP_WINDOW_MS = 6e3;
 var ENGAGED_TTL_MS = 15e3;
+var REWARD_WINDOW_MS = 5e3;
+var REWARD_CATEGORIES = /* @__PURE__ */ new Set(["chest", "stall"]);
 var _CollectionLogPlugin = class _CollectionLogPlugin extends Plugin {
+  // most-recent worldObject we were skilling on
   constructor() {
     super();
     this.pluginName = "Collection Log";
@@ -20,6 +23,12 @@ var _CollectionLogPlugin = class _CollectionLogPlugin extends Plugin {
     this.seenGround = /* @__PURE__ */ new Set();
     // ground-item instance ids already processed
     this.selectedSource = "";
+    // chest/stall reward detection (rewards land straight in the inventory, no ground item)
+    this.invSnapshot = /* @__PURE__ */ new Map();
+    // itemId -> total qty currently in inventory
+    this.invReady = false;
+    // first snapshot taken (don't log the starting inventory)
+    this.lastSkillObj = null;
     /** Press L to toggle the log (ignored while typing in chat / an input). */
     this.keyHandlerInstalled = false;
     this.settings.deathRangeTiles = { text: "Max kill distance (tiles)", type: SettingsTypes.range, value: 6, min: 2, max: 14, callback: () => {
@@ -127,6 +136,47 @@ var _CollectionLogPlugin = class _CollectionLogPlugin extends Plugin {
       }
       for (const id of this.seenGround) if (!seenNow.has(id)) this.seenGround.delete(id);
     }
+    const soid = gm.skillingObjectId | 0;
+    if (soid >= 0) {
+      const info = this.worldObjectInfo(soid);
+      if (info) this.lastSkillObj = { id: soid, name: info.name, category: info.category, t: now };
+    }
+    const inv = this.readInventory();
+    if (!this.invReady) {
+      this.invSnapshot = inv;
+      this.invReady = true;
+    } else {
+      const so = this.lastSkillObj;
+      const rewardSrc = so && now - so.t < REWARD_WINDOW_MS && REWARD_CATEGORIES.has(so.category) ? so.name : null;
+      if (rewardSrc) {
+        for (const [itemId, qty] of inv) {
+          const gained = qty - (this.invSnapshot.get(itemId) || 0);
+          if (gained > 0) this.logCollected(itemId, gained, rewardSrc);
+        }
+      }
+      this.invSnapshot = inv;
+    }
+  }
+  /** Sum the player's inventory by item id, read from the live inventory DOM. */
+  readInventory() {
+    const m = /* @__PURE__ */ new Map();
+    document.querySelectorAll(".item-icon[data-item-id]").forEach((el) => {
+      const id = parseInt(el.dataset.itemId || "", 10);
+      if (!id) return;
+      const q = parseInt(el.dataset.itemQuantity || "1", 10) || 1;
+      m.set(id, (m.get(id) || 0) + q);
+    });
+    return m;
+  }
+  /** Resolve a worldObject instance id → its def name + category (chest/stall/rock/…). */
+  worldObjectInfo(id) {
+    const gm = this.gm;
+    if (!gm) return null;
+    const wo = gm.worldObjectDefs?.get(id);
+    if (!wo) return null;
+    const def = gm.objectDefsCache?.get(wo.defId);
+    if (!def) return null;
+    return { name: (def.name ?? `Object #${wo.defId}`) + "", category: (def.category ?? "") + "" };
   }
   /** Generic entry point — also used for stall/chest/quest rewards once inventory hooks land. */
   logCollected(itemId, qty, source) {
