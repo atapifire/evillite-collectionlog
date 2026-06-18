@@ -5,10 +5,23 @@
   "type": "module",
   "license": "GPL-3.0-only",
   "author": "atapifire",
-  "evillite": { "id": "collection-log", "displayName": "Collection Log", "entry": "dist/collection-log.js", "minClientVersion": "0.2.0" },
+  "evillite": {
+    "id": "collection-log",
+    "displayName": "Collection Log",
+    "entry": "dist/collection-log.js",
+    "minClientVersion": "0.2.0"
+  },
   "scripts": {
     "build": "esbuild src/CollectionLogPlugin.ts --bundle --format=esm --platform=browser --target=es2020 --external:@evillite/core --outfile=dist/collection-log.js",
     "typecheck": "tsc --noEmit"
   },
-  "devDependencies": { "@evillite/core": "^0.1.2", "esbuild": "^0.25.0", "typescript": "^5.4.0" }
+  "devDependencies": {
+    "@evillite/core": "file:./evillite-core.tgz",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "packageManager": "yarn@4.9.1"
 }
